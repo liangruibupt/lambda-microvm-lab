@@ -70,6 +70,33 @@ index 6c20c4f..02c32ff 100644
      # Teach the Edge TTS voice picker to speak Japanese (stock only auto-switches
      # to Chinese for CJK; kana-based Japanese detection is missing upstream).
      && node /opt/poc/patch-tts-ja.mjs \
+diff --git a/src/microvm/efs-monitor.sh b/src/microvm/efs-monitor.sh
+index 313c23b..f8b40d5 100644
+--- a/src/microvm/efs-monitor.sh
++++ b/src/microvm/efs-monitor.sh
+@@ -30,9 +30,21 @@ while true; do
+       echo "[efs-monitor] EFS mounted from ${EFS_HOST} at $(date -u +%FT%TZ)"
+       TDIR="$EFS_DIR/tenants/$TENANT"
+       mkdir -p "$TDIR"
+-      if [ ! -f "$TDIR/openclaw.json" ]; then
++      # Adopt-vs-seed detection. MUST key on a dedicated sentinel, NOT on
++      # openclaw.json: this script overwrites $TDIR/openclaw.json unconditionally a
++      # few lines below (config is image-owned), so openclaw.json is a poor "has this
++      # tenant been seeded before?" signal — and in practice a gen>=2 tenant was seen
++      # taking the seed branch and clobbering its own persisted state. The sentinel is
++      # written+fsync'd only AFTER the seed copy fully completes, so its presence is a
++      # durable, unambiguous "already seeded" marker that survives VM regeneration.
++      SEEDED_MARK="$TDIR/.tenant-seeded"
++      if [ ! -f "$SEEDED_MARK" ]; then
+         echo "[efs-monitor] tenant $TENANT first generation: seeding from local state"
+         cp -a "$STATE_DIR/." "$TDIR/"
++        # Write the sentinel only after the copy lands, then fsync the dir so the
++        # marker (and the seeded tree) are durable on EFS before we proceed.
++        : > "$SEEDED_MARK"
++        python3 -c 'import os,sys; d=os.open(sys.argv[1],os.O_RDONLY); os.fsync(d); os.close(d)' "$TDIR" 2>/dev/null || sync
+       else
+         echo "[efs-monitor] tenant $TENANT has prior state - adopting it"
+       fi
 diff --git a/src/microvm/openclaw.json b/src/microvm/openclaw.json
 index f953626..7de4f7a 100644
 --- a/src/microvm/openclaw.json
