@@ -71,7 +71,7 @@ index 6c20c4f..02c32ff 100644
      # to Chinese for CJK; kana-based Japanese detection is missing upstream).
      && node /opt/poc/patch-tts-ja.mjs \
 diff --git a/src/microvm/efs-monitor.sh b/src/microvm/efs-monitor.sh
-index 313c23b..f8b40d5 100644
+index 313c23b..3b45216 100644
 --- a/src/microvm/efs-monitor.sh
 +++ b/src/microvm/efs-monitor.sh
 @@ -30,9 +30,21 @@ while true; do
@@ -97,6 +97,33 @@ index 313c23b..f8b40d5 100644
        else
          echo "[efs-monitor] tenant $TENANT has prior state - adopting it"
        fi
+@@ -99,6 +111,26 @@ HEAL
+       T0=$(date +%s%3N)
+       mount --bind "$TDIR" "$STATE_DIR"
+       echo "[efs-monitor] timing: bind mount $(( $(date +%s%3N) - T0 ))ms"
++      # DIAGNOSTIC + HARDENING: confirm the bind actually took. If $STATE_DIR is not a
++      # mountpoint after `mount --bind`, agent writes silently go to the LOCAL dir and die
++      # with the VM generation (the observed cross-generation state loss). Log the outcome
++      # explicitly (runtime efs-monitor logs are the only reliable signal here) and retry
++      # once, since a race with the gateway holding the dir can make the first bind no-op.
++      if mountpoint -q "$STATE_DIR"; then
++        echo "[efs-monitor] bind OK: $STATE_DIR is a mountpoint -> $TDIR"
++      else
++        echo "[efs-monitor] WARN bind did NOT take ($STATE_DIR not a mountpoint); retrying after settling"
++        sleep 2
++        mount --bind "$TDIR" "$STATE_DIR" || true
++        if mountpoint -q "$STATE_DIR"; then
++          echo "[efs-monitor] bind OK on retry: $STATE_DIR -> $TDIR"
++        else
++          echo "[efs-monitor] ERROR bind still not a mountpoint; agent writes will NOT persist to EFS"
++        fi
++      fi
++      # Prove writes land on EFS: list both sides so a cross-gen diagnosis has a signal.
++      echo "[efs-monitor] state-dir listing: $(ls -A "$STATE_DIR" 2>/dev/null | tr '\n' ' ')"
++      echo "[efs-monitor] efs-subtree listing: $(ls -A "$TDIR" 2>/dev/null | tr '\n' ' ')"
+       touch "$MARKER"
+       echo "[efs-monitor] state dir now EFS-backed for tenant $TENANT; bouncing gateway"
+       pkill -f "openclaw.mjs gateway" || true
 diff --git a/src/microvm/openclaw.json b/src/microvm/openclaw.json
 index f953626..7de4f7a 100644
 --- a/src/microvm/openclaw.json
