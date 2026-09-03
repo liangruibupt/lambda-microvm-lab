@@ -135,10 +135,63 @@ expensive/complex to force for marginal added signal:
 ---
 
 ## Summary
-
 Confirmed live: **multi-tenant isolation** (the headline claim), **within-generation state
 persistence**, **cold-vs-warm latency delta**, **suspend/resume** (Task 3), and
 **tenant-isolated agent failure**. **Cross-generation state survival was not cleanly
 reproduced** (a timing/write-durability nuance in the agent, not a design flaw) and is the
 one dimension flagged for a dedicated retest. Security/egress/credential properties are
 design-verified rather than live-exploited. NAT (~$32/mo) is the only standing cost.
+
+
+---
+
+## Addendum (deep investigation, 2026-09-03) — CORRECTION to the cross-generation root cause
+
+A follow-up attempt to *fix and validate* the cross-generation state loss showed my earlier
+"confirmed adopt-vs-seed bug" conclusion was **not safely established**, and turned up the
+real mechanism. Recording this honestly.
+
+**What I did:** wrote a candidate fix (a `.tenant-seeded` sentinel in `efs-monitor.sh`),
+rebuilt the image via `update-microvm-image`, and tried terminate→regenerate→recall.
+
+**Mistake I made (and caught):** `update-microvm-image` does NOT inherit the image's
+`Hooks`, `EnvironmentVariables`, **or `AdditionalOsCapabilities`** — each must be re-passed.
+My first rebuilds silently dropped them:
+- dropping `Hooks`/`EFS_ID` → VM failed to launch (`run hook must be enabled`);
+- dropping `AdditionalOsCapabilities: [ALL]` → VM **could not `mount -t nfs4`**
+  (`mount.nfs4: Operation not permitted`) → **EFS never mounted**.
+
+So my "fix validation failed" runs were on a crippled image where EFS wasn't even mounted —
+they never exercised the sentinel logic. **This invalidates any claim that the sentinel is
+the confirmed fix.**
+
+**What the properly-rebuilt image (ALL caps + hooks + env, v4.0) then showed (tenant6):**
+- ✅ EFS **does** mount at `/mnt/efs` (NFS4, fs-03414cea39cb0d27d) once `ALL` caps are present.
+- ❌ But `MEMORY.md` and `.tenant-seeded` were **absent** from `/mnt/efs/tenants/tenant6/`;
+  the agent wrote to *local* `/home/node/.openclaw`, and the mount table showed EFS at
+  `/mnt/efs` but **no bind mount of `/home/node/.openclaw`**.
+
+**Revised root-cause hypothesis (not yet conclusively confirmed):** the real failure is that
+`efs-monitor.sh`'s final `mount --bind "$TDIR" "$STATE_DIR"` (binding the tenant's EFS subtree
+over the agent state dir) **is not taking effect**, so agent writes never reach EFS and die
+with the VM. The adopt-vs-seed logic is downstream of this and may be a red herring. Not fully
+confirmed because the diagnostic channel (agent tool output via the orchestrator) **truncates**
+long replies and the MicroVM shell path needs an undocumented protocol client.
+
+**Honest status:** cross-generation state survival is **broken**, but the precise mechanism is
+**not conclusively pinned** — bind-mount-not-taking-effect is now the leading hypothesis over
+the earlier adopt-vs-seed-sentinel theory. The `.tenant-seeded` change is plausible hardening
+but is **NOT a validated fix**. A proper fix needs: (1) an explicit post-bind
+`mountpoint -q "$STATE_DIR"` check + log in efs-monitor.sh, (2) confirm agent writes land
+under `/mnt/efs/tenants/$TENANT`, then (3) re-run terminate→regenerate→recall on an image
+built with ALL caps + hooks + env.
+
+**Operational note:** rebuilt image versions 2.0 (no hooks/caps), 3.0 (hooks, no caps), 4.0
+(hooks+caps) now exist on `openclaw-mt-openclaw` from this investigation; the orchestrator was
+reverted to the original **v1.0** (which has ALL caps). The stack is otherwise unchanged.
+
+**Key transferable lesson:** `update-microvm-image` starts each new version from the
+code artifact ONLY — it does not carry forward Hooks, EnvironmentVariables, or
+AdditionalOsCapabilities from the prior version. Always re-pass the full config (mirror the
+CloudFormation `AWS::Lambda::MicrovmImage` properties) or the new version will be
+subtly broken in ways that only surface at run/mount time.
