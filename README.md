@@ -106,6 +106,16 @@ curl -sS "https://${EP}/" -H "X-aws-proxy-auth: ${TOKEN}" -H "X-aws-proxy-port: 
 ```
 `curl_microvm.sh <microvmId> <endpoint> [path]` wraps exactly this.
 
+Example run (from a plain shell, VM auto-resumed on the request):
+```console
+$ curl -sS "https://${EP}/" \
+    -H "X-aws-proxy-auth: ${TOKEN}" \
+    -H "X-aws-proxy-port: 5000"
+{"hits":6,"hostname":"localhost","message":"hello from inside a Lambda MicroVM","uptime_seconds":899.1}
+```
+Note `hits` keeps climbing (6 here) across separate sessions and suspend/resume cycles —
+that's the same long-lived process, not a fresh boot.
+
 ### Actual live results (2026-09-03, us-east-1)
 ```
 create-microvm-image  -> state CREATING -> CREATED   (~3 min)
