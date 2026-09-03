@@ -1,0 +1,6 @@
+# runtime state written by flask_microvm.sh
+.microvm-state
+# the multi-tenant sample is cloned on demand, not vendored
+sample-multi-tenant-ai-agents-on-lambda-microvm/
+__pycache__/
+*.pyc
