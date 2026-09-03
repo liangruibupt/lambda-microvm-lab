@@ -70,6 +70,67 @@ index 6c20c4f..02c32ff 100644
      # Teach the Edge TTS voice picker to speak Japanese (stock only auto-switches
      # to Chinese for CJK; kana-based Japanese detection is missing upstream).
      && node /opt/poc/patch-tts-ja.mjs \
+diff --git a/src/microvm/efs-monitor.sh b/src/microvm/efs-monitor.sh
+index 313c23b..e28f6e2 100644
+--- a/src/microvm/efs-monitor.sh
++++ b/src/microvm/efs-monitor.sh
+@@ -30,12 +30,42 @@ while true; do
+       echo "[efs-monitor] EFS mounted from ${EFS_HOST} at $(date -u +%FT%TZ)"
+       TDIR="$EFS_DIR/tenants/$TENANT"
+       mkdir -p "$TDIR"
+-      if [ ! -f "$TDIR/openclaw.json" ]; then
++      # Adopt-vs-seed detection. MUST key on a dedicated sentinel, NOT on
++      # openclaw.json: this script overwrites $TDIR/openclaw.json unconditionally a
++      # few lines below (config is image-owned), so openclaw.json is a poor "has this
++      # tenant been seeded before?" signal — and in practice a gen>=2 tenant was seen
++      # taking the seed branch and clobbering its own persisted state. The sentinel is
++      # written+fsync'd only AFTER the seed copy fully completes, so its presence is a
++      # durable, unambiguous "already seeded" marker that survives VM regeneration.
++      SEEDED_MARK="$TDIR/.tenant-seeded"
++      if [ ! -f "$SEEDED_MARK" ]; then
+         echo "[efs-monitor] tenant $TENANT first generation: seeding from local state"
+         cp -a "$STATE_DIR/." "$TDIR/"
++        # Write the sentinel only after the copy lands, then fsync the dir so the
++        # marker (and the seeded tree) are durable on EFS before we proceed.
++        : > "$SEEDED_MARK"
++        python3 -c 'import os,sys; d=os.open(sys.argv[1],os.O_RDONLY); os.fsync(d); os.close(d)' "$TDIR" 2>/dev/null || sync
+       else
+         echo "[efs-monitor] tenant $TENANT has prior state - adopting it"
+       fi
++      # BIND FIRST: make the state dir EFS-backed immediately after seed/adopt, BEFORE the
++      # config/materialize/chown steps below. The chown -R over NFS can take 17.5s+ (one
++      # round trip per file) and previously ran BEFORE the bind — the runtime log stopped
++      # right after "seeding" and the live VM showed /home/node/.openclaw NOT a mountpoint,
++      # i.e. the bind was never reached. Binding first guarantees agent writes land on EFS
++      # regardless of how slow the post-bind housekeeping is. The housekeeping still targets
++      # the same files (now reachable as either $TDIR or the bound $STATE_DIR).
++      T0=$(date +%s%3N)
++      mount --bind "$TDIR" "$STATE_DIR"
++      echo "[efs-monitor] timing: bind mount $(( $(date +%s%3N) - T0 ))ms"
++      if mountpoint -q "$STATE_DIR"; then
++        echo "[efs-monitor] bind OK: $STATE_DIR is a mountpoint -> $TDIR"
++      else
++        echo "[efs-monitor] WARN bind did NOT take; retrying after settling"
++        sleep 2; mount --bind "$TDIR" "$STATE_DIR" || true
++        mountpoint -q "$STATE_DIR" && echo "[efs-monitor] bind OK on retry -> $TDIR" \
++          || echo "[efs-monitor] ERROR bind still not a mountpoint; writes will NOT persist to EFS"
++      fi
+       # Config is image-owned; only agent state persists across generations. Without
+       # this, a stale EFS openclaw.json shadows every config change shipped in the image.
+       # Also drop OpenClaw's backups: its watchdog restores .last-good over any config
+@@ -96,9 +126,9 @@ if changed:
+     json.dump(d, open(p, "w"), indent=1)
+ HEAL
+       echo "[efs-monitor] timing: session heal $(( $(date +%s%3N) - T0 ))ms"
+-      T0=$(date +%s%3N)
+-      mount --bind "$TDIR" "$STATE_DIR"
+-      echo "[efs-monitor] timing: bind mount $(( $(date +%s%3N) - T0 ))ms"
++      # Prove writes land on EFS: list both sides so a cross-gen diagnosis has a signal.
++      echo "[efs-monitor] state-dir listing: $(ls -A "$STATE_DIR" 2>/dev/null | tr '\n' ' ')"
++      echo "[efs-monitor] efs-subtree listing: $(ls -A "$TDIR" 2>/dev/null | tr '\n' ' ')"
+       touch "$MARKER"
+       echo "[efs-monitor] state dir now EFS-backed for tenant $TENANT; bouncing gateway"
+       pkill -f "openclaw.mjs gateway" || true
 diff --git a/src/microvm/openclaw.json b/src/microvm/openclaw.json
 index f953626..7de4f7a 100644
 --- a/src/microvm/openclaw.json
