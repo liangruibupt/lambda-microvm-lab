@@ -44,25 +44,50 @@ tenant1: turn 1 "remember my lucky number is 7777" → turn 2 "what is my lucky 
 - **Warm turn:** 3-6s end-to-end (`cold: False`). Large, clear delta — the snapshot-resume
   value proposition.
 
-### B2. Idle auto-reap + cross-generation state survival — ⚠️ PARTIAL / nuanced
-Real idle-reap needs `IDLE_REAP_SECONDS=3600` (1h) of inactivity — too long to sit on live,
-so we **forced** a generation turnover: `terminate-microvm` on tenant2's VM (simulating the
-reap), then messaged it again.
-- **VM regeneration worked:** a brand-new VM cold-started (`cold: True`, 46s), DynamoDB
-  `generation 1→2`, new id `microvm-e8531adb…` ≠ old `microvm-9afade3d…`.
-- **BUT the recall after regeneration returned "I don't have that in my memory files"** —
-  the "durian" fact did **not** survive the VM termination in this run.
-- **Interpretation (honest):** the design *does* persist across generations —
-  `efs-monitor.sh` mounts `/mnt/efs`, and for a tenant with prior state it "adopts" the
-  existing `/mnt/efs/tenants/$TENANT` subtree and restarts the gateway against it. The miss
-  is a **timing / write-durability nuance**, not a broken design: either the earlier write
-  landed before the EFS bind was fully adopted, or the agent kept the value in conversation
-  context rather than durably writing a memory file (its own wording varied between "I'll add
-  it to USER.md" and "I won't store that"). The cross-*generation* survival claim is
-  therefore **not cleanly reproduced here** — worth a dedicated retest that (a) confirms the
-  agent wrote to the EFS-backed path and (b) waits for `efs-mounted` marker before the write.
-- Contrast with A1: state survives across **turns within one generation** (proven); state
-  across a full **VM death + regeneration** was not cleanly demonstrated in this session.
+### B2. Idle auto-reap + cross-generation state survival — ❌ FAIL (confirmed sample bug)
+Real idle-reap needs `IDLE_REAP_SECONDS=3600` (1h) of inactivity, so we **forced** a
+generation turnover: confirm a durable write, then `terminate-microvm` (simulating the reap),
+then message again to force a fresh-generation cold start.
+
+**Careful retest (tenant3, 2026-09-03):**
+1. Stored "project codename FALCON"; the agent confirmed it wrote
+   `/home/node/.openclaw/workspace/MEMORY.md` (which is `STATE_DIR` = the EFS-bind-mount root).
+2. Confirmed EFS actually mounted on gen-1:
+   `[efs-monitor] EFS mounted … ; tenant tenant3 first generation: seeding from local state`.
+3. Same-generation recall worked: **"Your project codename is FALCON."**
+4. Terminated the gen-1 VM → messaged again → gen-2 VM cold-started
+   (`generation 1→2`, new id `microvm-02863892…`).
+5. Gen-2 recall: **"I don't have your project codename stored… no record of it."** — FALCON lost.
+
+**Confirmed root cause (a real bug in the sample, reproduced twice — durian, then FALCON):**
+Gen-2's log said `tenant tenant3 first generation: seeding from local state` — but this is the
+*second* generation. `efs-monitor.sh` decides adopt-vs-seed by testing
+`[ ! -f "$EFS_DIR/tenants/$TENANT/openclaw.json" ]`:
+```sh
+if [ ! -f "$TDIR/openclaw.json" ]; then
+    echo "… first generation: seeding from local state"
+    cp -a "$STATE_DIR/." "$TDIR/"          # overwrites EFS with the image's empty local state
+else
+    echo "… has prior state - adopting it"  # never reached on gen-2 in our runs
+fi
+```
+On gen-2 the marker file was **not present**, so the sample took the *seed* branch and
+overwrote the tenant's EFS state with the image's fresh local state — discarding the
+persisted `MEMORY.md`. The "adopt prior state" path never triggered. Net effect: **every
+generation re-seeds, so agent memory does NOT survive a full VM death + regeneration**, even
+though the write genuinely reached the EFS mount within the generation.
+
+**Distinction that matters:**
+- State survives across **turns within one generation** — ✅ (A1, and step 3 above).
+- State survives a **VM suspend/resume** — ✅ (B3 / Task 3, snapshot restores memory).
+- State survives a full **VM termination + regeneration** — ❌ broken by the adopt-vs-seed
+  marker bug above. This is the sample's headline "state parks on EFS, survives across VM
+  generations" claim, and it does **not** hold as shipped.
+
+**Suggested fix (for a sample PR):** make the adopt-vs-seed decision key on a dedicated
+state marker the seed writes durably *after* `cp -a` completes (e.g. a `.tenant-initialized`
+sentinel), rather than on `openclaw.json` — which the code overwrites unconditionally right
+after the check, muddying the signal.
 
 ### B3. Suspend / resume — ✅ PASS (Task 3, same primitive)
 Verified in Task 3 on the single Flask MicroVM: `suspend-microvm` → `resume-microvm`
@@ -138,7 +163,9 @@ expensive/complex to force for marginal added signal:
 
 Confirmed live: **multi-tenant isolation** (the headline claim), **within-generation state
 persistence**, **cold-vs-warm latency delta**, **suspend/resume** (Task 3), and
-**tenant-isolated agent failure**. **Cross-generation state survival was not cleanly
-reproduced** (a timing/write-durability nuance in the agent, not a design flaw) and is the
-one dimension flagged for a dedicated retest. Security/egress/credential properties are
-design-verified rather than live-exploited. NAT (~$32/mo) is the only standing cost.
+**tenant-isolated agent failure**. **Cross-generation state survival is BROKEN as shipped** —
+a careful retest (tenant3/FALCON) pinned the root cause to an adopt-vs-seed marker bug in
+`efs-monitor.sh` that re-seeds every generation from empty local state, discarding the
+EFS-persisted agent memory (reproduced twice; fix suggested in B2). Security/egress/credential
+properties are design-verified rather than live-exploited. NAT (~$32/mo) is the only standing
+cost.
